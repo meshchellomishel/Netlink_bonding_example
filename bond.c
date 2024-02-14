@@ -19,7 +19,7 @@
 #define LAG_DEFAULT_MIIMON 100
 #define BOND_TYPE "bond"
 
-#define BOND_MAX_FULL_STATUS 20
+#define BOND_MAX_FULL_STATUS 21
 #define BOND_MAX_ORIGINAL_STATUS 10
 
 #define NLMSG_TAIL(nmsg) \
@@ -342,12 +342,6 @@ struct nl_msg *build_msg(int nlmsg_type, int flags, struct rtnl_link *link)
 	if (ret < 0)
 		return NULL;
 
-	if (link && nlmsg_type == RTM_NEWLINK) {
-		ret = rtnl_link_fill_info(msg, link);
-		if (ret < 0)
-			return NULL;
-	}
-
 	return msg;
 }
 
@@ -358,6 +352,8 @@ int _fill_default_info(struct nl_msg *msg, const char *ifname)
 	struct rtattr *linkinfo, *data;
 	char *type = BOND_TYPE;
 
+	nla_put_string(msg, IFLA_IFNAME, ifname);
+
 	linkinfo = nla_nest_start(msg, IFLA_LINKINFO);
 	{
 		nla_put_string(msg, IFLA_INFO_KIND, type);
@@ -367,6 +363,28 @@ int _fill_default_info(struct nl_msg *msg, const char *ifname)
 			nla_put_u8(msg, IFLA_BOND_MODE, LAG_MODE_LACP);
 			nla_put_u32(msg, IFLA_BOND_MIIMON, LAG_DEFAULT_MIIMON);
 			nla_put_u8(msg, IFLA_BOND_AD_SELECT, 3);
+		}
+		nla_nest_end(msg, data);
+	}
+	nla_nest_end(msg, linkinfo);
+
+	return 0;
+}
+
+int _fill_default_slave_info(struct nl_msg *msg, const char *ifname)
+{
+	int ret;
+	int iflatype;
+	struct rtattr *linkinfo, *data;
+	char *type = BOND_TYPE;
+
+	linkinfo = nla_nest_start(msg, IFLA_LINKINFO);
+	{
+		nla_put_string(msg, IFLA_INFO_KIND, "bond");
+
+		data = nla_nest_start(msg, IFLA_INFO_SLAVE_DATA);
+		{
+			nla_put_u16(msg, IFLA_BOND_SLAVE_AD_ACTOR_PORT_PRIO, 64464);
 		}
 		nla_nest_end(msg, data);
 	}
@@ -444,6 +462,44 @@ int nl_talk(struct bond *bond, struct nl_msg *msg)
 	return 0;
 }
 
+int set_port_prio(struct bond *bond, const char *iface_name, int port_prio)
+{
+	int ret;
+	struct nl_cache *cache = NULL;
+	struct link *link = NULL;
+	struct nl_msg *msg = NULL;
+
+	link = rtnl_link_get_by_name(bond->cache, iface_name);
+	if (!link) {
+		printf("ERROR: Failed to get iface link\n");
+		ret = -1;
+		goto link_put;
+	}
+
+	msg = build_msg(RTM_NEWLINK, NLM_F_REQUEST, link);
+	if (!msg) {
+		printf("ERROR: Failed to build msg\n");
+		ret = -1;
+		goto msg_free;
+	}
+
+	ret = _fill_default_slave_info(msg, iface_name);
+	if (ret < 0) {
+		printf("ERROR: Failed to fill slave info\n");
+		ret = -1;
+		goto msg_free;
+	}
+
+	ret = nl_talk(bond, msg);
+
+msg_free:
+	nlmsg_free(msg);
+link_put:
+	rtnl_link_put(link);
+
+	return ret;
+}
+
 int create_bond(struct bond *bond, const char *ifname)
 {
 	int ret;
@@ -460,7 +516,7 @@ int create_bond(struct bond *bond, const char *ifname)
 		printf("ERROR: Failed to create msg\n");
 		return -1;
 	}
-	ret = _fill_default_info(msg, link);
+	ret = _fill_default_info(msg, ifname);
 	if (ret < 0) {
 		printf("ERROR: Failed to fill default info\n");
 		return ret;
@@ -564,8 +620,12 @@ int main(void)
 	if (ret < 0)
 		printf("ERROR: Failed to create bond\n");
 
+	ret = set_port_prio(bond, "eth21", 254);
+	if (ret < 0)
+		printf("ERROR: Failed to set port prio\n");
+
 	// читаем и разбираем сообщения из сокета
-	while (1) {
+	/*while (1) {
 		clock_t t, t0;
 
 		sleep(3);
@@ -575,9 +635,9 @@ int main(void)
 
 		t = clock();
 		printf("get info from one port: %f\n", (double)(t - t0)/CLOCKS_PER_SEC);
-	}
+	}*/
 
 on_error:
 	bond_destroy(bond);
-	return -1;
+	return ret;
 }
