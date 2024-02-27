@@ -237,7 +237,7 @@ static int set_socket(struct bond *bond)
 		return -1;
 	}
 
-	nl_socket_set_peer_groups(bond->sock, RTMGRP_LINK | RTMGRP_NOTIFY);
+	nl_socket_set_peer_groups(bond->sock, RTMGRP_LINK);
 	ret = nl_socket_modify_cb(bond->sock, NL_CB_VALID, NL_CB_CUSTOM, bond_modify_cb, bond);
 	if (ret < 0) {
 		printf("ERROR: Failed to set callback function to socket\n");
