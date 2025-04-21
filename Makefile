@@ -1,8 +1,11 @@
-LIBS=/usr/lib/libnl-3.so /usr/lib/libnl-route-3.so /usr/lib/libnl-genl-3.so /usr/lib/libmnl.so.0.2.0
+LIBS=/usr/lib/libnl-3.so /usr/lib/libnl-route-3.so
 INCNL=/usr/include/libnl3/
 
-default: Makefile bond.c
-	gcc bond.c $(LIBS) -levent -I$(INCNL) -o bond -Wall -g
+conf: configtests.c Makefile
+	gcc configtests.c -o conf -Wall -g
+
+bond: Makefile bond.c
+	gcc -g bond.c -lnl-3 -lnl-route-3 -I$(INCNL) -o bond
 
 prio:
 	gcc sysprio.c -o sysprio -Wall -g

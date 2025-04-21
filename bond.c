@@ -37,6 +37,7 @@ enum rx_state {
 
 struct bond {
 	struct nl_sock *sock;
+	struct nl_sock *ntfs_nl_sock;
 	struct nl_cache *cache;
 	struct nl_sock *evcb;
 };
@@ -104,9 +105,6 @@ void parse_slave(struct nlattr *linkinfo)
 		printf("Failed to parse linkinfo\n");
 		return;
 	}
-
-	if (slave[IFLA_BOND_SLAVE_IFNAME])
-		printf("[%s]\n", nla_get_string(slave[IFLA_BOND_SLAVE_IFNAME]));
 
 	printf("\t[ACTOR]\n");
 
@@ -202,13 +200,6 @@ void parse_attrs(struct nl_msg *msg)
 				return;
 			}
 
-			if (bond[IFLA_BOND_SLAVE_LIST]) {
-				nla_for_each_nested(port, bond[IFLA_BOND_SLAVE_LIST], i) {
-					parse_slave(port);
-				}
-			} else
-				printf("No port list(\n");
-
 		} else
 			printf("NO INFO bond\n");
 	}
@@ -221,6 +212,57 @@ int bond_modify_cb(struct nl_msg *msg, void *arg)
 	return NL_SKIP;
 }
 
+static int set_ntfs_socket(struct bond *bond)
+{
+	int ret;
+
+	bond->ntfs_nl_sock = nl_socket_alloc();
+	if (!bond->ntfs_nl_sock) {
+		printf("Failed to allocate netlink socket\n");
+		goto on_error;
+	}
+
+	ret = nl_connect(bond->ntfs_nl_sock, NETLINK_ROUTE);
+	if (ret < 0) {
+		printf("Failed to connect to generic netlink: %s\n",
+			 nl_geterror(ret));
+		goto on_error;
+	}
+
+	ret = nl_socket_add_membership(bond->ntfs_nl_sock, RTNLGRP_LINK);
+	if (ret < 0) {
+		printf("Failed to add mcast group membership: %s\n",
+			 nl_geterror(ret));
+		goto on_error;
+	}
+
+	ret = nl_socket_add_membership(bond->ntfs_nl_sock, RTNLGRP_NOTIFY);
+	if (ret < 0) {
+		printf("Failed to add mcast group membership: %s\n",
+			 nl_geterror(ret));
+		goto on_error;
+	}
+
+	nl_socket_modify_cb(bond->ntfs_nl_sock, NL_CB_VALID, NL_CB_CUSTOM,
+			    bond_modify_cb, bond);
+
+	ret = nl_socket_set_nonblocking(bond->ntfs_nl_sock);
+	if (ret < 0) {
+		printf("Failed to set socket nonblocking: %s\n",
+			 nl_geterror(ret));
+		goto on_error;
+	}
+
+	/* Required to receive async event notifications */
+	nl_socket_disable_seq_check(bond->ntfs_nl_sock);
+
+	return 0;
+on_error:
+	nl_socket_free(bond->ntfs_nl_sock);
+	bond->ntfs_nl_sock = NULL;
+	return -1;
+}
+
 static int set_socket(struct bond *bond)
 {
 	int ret;
@@ -231,12 +273,6 @@ static int set_socket(struct bond *bond)
 		return -1;
 	}
 
-	bond->evcb = nl_socket_alloc();
-	if (!bond->evcb) {
-		printf("ERROR: Failed to create event socket\n");
-		return -1;
-	}
-
 	nl_socket_set_peer_groups(bond->sock, RTMGRP_LINK);
 	ret = nl_socket_modify_cb(bond->sock, NL_CB_VALID, NL_CB_CUSTOM, bond_modify_cb, bond);
 	if (ret < 0) {
@@ -244,11 +280,6 @@ static int set_socket(struct bond *bond)
 		return ret;
 	}
 
-	ret = nl_connect(bond->evcb, NETLINK_ROUTE);
-	if (ret < 0) {
-		printf("ERROR: Failed to connect to event socket\n");
-		return ret;
-	}
 
 	ret = nl_connect(bond->sock, NETLINK_ROUTE);
 	if (ret < 0) {
@@ -262,6 +293,12 @@ static int set_socket(struct bond *bond)
 		return ret;
 	}
 
+	ret = set_ntfs_socket(bond);
+	if (ret < 0) {
+		printf("ERROR: Failed to set nlfs socket\n");
+		return ret;
+	}
+
 	return 0;
 }
 
@@ -270,7 +307,12 @@ static int set_cahce(struct bond *bond)
 {
 	int ret;
 
-	ret = rtnl_link_alloc_cache_flags(bond->sock, AF_UNSPEC, &bond->cache, NL_CACHE_AF_ITER);
+	// ret = rtnl_link_alloc_cache_flags(bond->sock, AF_UNSPEC, &bond->cache, NL_CACHE_AF_ITER);
+	// if (ret < 0) {
+	// 	printf("ERROR: Failed to alloc link cache\n");
+	// 	return ret;
+	// }
+	ret = rtnl_link_alloc_cache(bond->sock, AF_UNSPEC, &bond->cache);
 	if (ret < 0) {
 		printf("ERROR: Failed to alloc link cache\n");
 		return ret;
@@ -316,6 +358,13 @@ struct rtnl_link *build_bond_by_ifname(const char *ifname)
 		return NULL;
 	}
 	rtnl_link_set_name(link, ifname);
+	rtnl_link_bond_set_mode(link, 4);
+	rtnl_link_bond_set_ad_lacp_active(link, 0);
+	rtnl_link_bond_set_ad_lacp_rate(link, 1);
+	rtnl_link_bond_set_ad_actor_sys_prio(link, 123);
+	rtnl_link_bond_set_ad_select(link, 2);
+	rtnl_link_bond_set_miimon(link, 101);
+	rtnl_link_bond_set_xmit_hash_policy(link, 2);
 
 	return link;
 }
@@ -342,6 +391,12 @@ struct nl_msg *build_msg(int nlmsg_type, int flags, struct rtnl_link *link)
 	if (ret < 0)
 		return NULL;
 
+	// ret = rtnl_link_build_add_request(link, NLM_F_REQUEST | NLM_F_CREATE, &msg);
+	// if (ret < 0) {
+	// 	printf("[ERROR]: Failed to build add request\n");
+	// 	return NULL;
+	// }
+
 	return msg;
 }
 
@@ -351,6 +406,8 @@ int _fill_default_info(struct nl_msg *msg, const char *ifname)
 	int iflatype;
 	struct rtattr *linkinfo, *data;
 	char *type = BOND_TYPE;
+	char mac_c[] = "11:11:11:11:11:11";
+	uint8_t mac[6] = {0x11, 0x11, 0x11, 0x11, 0x11, 0x11};
 
 	nla_put_string(msg, IFLA_IFNAME, ifname);
 
@@ -360,9 +417,9 @@ int _fill_default_info(struct nl_msg *msg, const char *ifname)
 
 		data = nla_nest_start(msg, IFLA_INFO_DATA);
 		{
-			nla_put_u8(msg, IFLA_BOND_MODE, LAG_MODE_LACP);
-			nla_put_u32(msg, IFLA_BOND_MIIMON, LAG_DEFAULT_MIIMON);
-			nla_put_u8(msg, IFLA_BOND_AD_SELECT, 3);
+			nla_put_u8(msg, IFLA_BOND_MODE, 4);
+			nla_put_u8(msg, IFLA_BOND_COUPLED_CONTROL, 0);
+			// nla_put(msg, IFLA_BOND_AD_ACTOR_SYSTEM, sizeof(mac_c), mac_c);
 		}
 		nla_nest_end(msg, data);
 	}
@@ -377,6 +434,8 @@ int _fill_default_slave_info(struct nl_msg *msg, const char *ifname)
 	int iflatype;
 	struct rtattr *linkinfo, *data;
 	char *type = BOND_TYPE;
+
+	nla_put_string(msg, IFLA_IFNAME, ifname);
 
 	linkinfo = nla_nest_start(msg, IFLA_LINKINFO);
 	{
@@ -400,19 +459,19 @@ int _enslave_iface(struct bond *bond, struct rtnl_link *slave, int master)
 	int slave_index = rtnl_link_get_ifindex(slave);
 	unsigned int flags = rtnl_link_get_flags(slave);
 
-	changes = rtnl_link_alloc();
-	if (!changes) {
-		printf("ERROR: Failed to allocate change link\n");
-		return -1;
-	}
+	// changes = rtnl_link_alloc();
+	// if (!changes) {
+	// 	printf("ERROR: Failed to allocate change link\n");
+	// 	return -1;
+	// }
 
-	if (flags & IFF_UP)
-		rtnl_link_unset_flags(changes, IFF_UP);
-	ret = rtnl_link_change(bond->sock, slave, changes, 0);
-	if (ret < 0) {
-		printf("ERROR: Failed to apply changes on iface\n");
-		return ret;
-	}
+	// if (flags & IFF_UP)
+	// 	rtnl_link_unset_flags(changes, IFF_UP);
+	// ret = rtnl_link_change(bond->sock, slave, changes, 0);
+	// if (ret < 0) {
+	// 	printf("ERROR: Failed to apply changes on iface\n");
+	// 	return ret;
+	// }
 
 	printf("Enslaving %d to %d...\n", slave_index, master);
 	return rtnl_link_bond_enslave_ifindex(bond->sock, master, slave_index);
@@ -516,6 +575,32 @@ int create_bond(struct bond *bond, const char *ifname)
 		printf("ERROR: Failed to create msg\n");
 		return -1;
 	}
+	// ret = rtnl_link_fill_info(msg, link);
+	// if (ret < 0) {
+	// 	printf("ERROR: Failed to fill info\n");
+	// 	return -1;
+	// }
+	ret = _fill_default_info(msg, ifname);
+	if (ret < 0) {
+		printf("ERROR: Failed to fill default info\n");
+		return ret;
+	}
+	ret = nl_talk(bond, msg);
+
+	rtnl_link_put(link);
+	return ret;
+}
+
+int set_bond(struct bond *bond, struct rtnl_link *link, const char *ifname)
+{
+	int ret;
+	struct nl_msg *msg;
+
+	msg = build_msg(RTM_NEWLINK, NLM_F_REQUEST, link);
+	if (!msg) {
+		printf("ERROR: Failed to create msg\n");
+		return -1;
+	}
 	ret = _fill_default_info(msg, ifname);
 	if (ret < 0) {
 		printf("ERROR: Failed to fill default info\n");
@@ -603,6 +688,51 @@ int main(void)
 {
 	int ret;
 	struct bond *bond = NULL;
+	struct rtnl_link *link = NULL;
+	char *array[] = {
+		"eth2",
+		"lag1",
+		"eth3",
+		"lag1",
+		"eth4",
+		"lag1",
+		"eth5",
+		"lag1",
+		"eth6",
+		"lag1",
+		"eth7",
+		"lag1",
+		"eth8",
+		"lag1",
+		"eth9",
+		"lag1",
+		"eth10",
+		"lag2",
+		"eth11",
+		"lag2",
+		"eth12",
+		"lag2",
+		"eth13",
+		"lag2",
+		"eth14",
+		"lag2",
+		"eth15",
+		"lag2",
+		"eth16",
+		"lag2",
+		"eth17",
+		"lag2",
+		"eth18",
+		"lag3",
+		"eth19",
+		"lag3",
+		"eth20",
+		"lag3",
+		"eth21",
+		"lag3",
+		"eth22",
+		"lag3",
+		};
 
 	bond = bond_alloc();
 	if (!bond) {
@@ -616,22 +746,56 @@ int main(void)
 		goto on_error;
 	}
 
-	ret = create_bond(bond, "bond0");
+	ret = create_bond(bond, "lag1");
 	if (ret < 0)
-		printf("ERROR: Failed to create bond\n");
+		return -1;
+
+	ret = create_bond(bond, "lag2");
+	if (ret < 0)
+		return -1;
+
+	ret = create_bond(bond, "lag3");
+	if (ret < 0)
+		return -1;
+
+	ret = create_bond(bond, "lag4");
+	if (ret < 0)
+		return -1;
+
+	for (int i = 0; i < sizeof(array); i++) {
+		ret = enslave_iface(bond, array[i+1], array[i]);
+		if (ret < 0)
+			printf("enslaved error: %d(%s)\n", ret, nl_geterror(ret));
+	}
+
+
+	/*link = rtnl_link_get_by_name(bond->cache, "bond0");
+	if (!link) {
+		printf("[ERROR]: Failed to found link\n");
+		goto on_error;
+	}
+	ret = set_bond(bond, link, "bond0");
+	if (ret < 0)
+		printf("[ERROR]: Failed to set bond\n");
 
 	ret = set_port_prio(bond, "eth21", 254);
 	if (ret < 0)
 		printf("ERROR: Failed to set port prio\n");
-
+	*/
 	// читаем и разбираем сообщения из сокета
 	/*while (1) {
 		clock_t t, t0;
+		struct nl_cb *cb;
+		int status = 0;
 
 		sleep(3);
 		t0 = clock();
 
-		get_state(bond, "bond0");
+		cb = nl_socket_get_cb(bond->ntfs_nl_sock);
+		do {
+			status = nl_recvmsgs_report(bond->ntfs_nl_sock, cb);
+		} while (status > 0);
+		nl_cb_put(cb);
 
 		t = clock();
 		printf("get info from one port: %f\n", (double)(t - t0)/CLOCKS_PER_SEC);
